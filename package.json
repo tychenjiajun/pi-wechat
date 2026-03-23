@@ -1,0 +1,57 @@
+{
+  "name": "pi-wechat",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "WeChat iLink bot extension for Pi coding agent",
+  "main": "index.ts",
+  "license": "MIT",
+  "author": "yangyang0507",
+  "homepage": "https://github.com/yangyang0507/pi-wechat#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yangyang0507/pi-wechat.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yangyang0507/pi-wechat/issues"
+  },
+  "scripts": {
+    "check": "tsx --tsconfig tsconfig.json -e \"await import('./index.ts')\""
+  },
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "wechat",
+    "ilink",
+    "bot",
+    "agent"
+  ],
+  "files": [
+    "index.ts",
+    "api.ts",
+    "client.ts",
+    "auth.ts",
+    "types.ts",
+    "LICENSE",
+    "README.md",
+    "README.zh-CN.md",
+    "tsconfig.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@types/node": "^22.10.5",
+    "@types/qrcode-terminal": "^0.12.2",
+    "tsx": "^4.20.3"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
+  }
+}
