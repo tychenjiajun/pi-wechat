@@ -15,7 +15,8 @@
     "url": "https://github.com/yangyang0507/pi-wechat/issues"
   },
   "scripts": {
-    "check": "tsx --tsconfig tsconfig.json -e \"await import('./index.ts')\""
+    "check": "tsx --tsconfig tsconfig.json -e \"await import('./index.ts')\"",
+    "prepack": "npm run check"
   },
   "keywords": [
     "pi",
