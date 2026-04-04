@@ -5,6 +5,7 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from '@mariozechner/pi-coding-agent';
+import { AssistantMessage } from '@mariozechner/pi-ai';
 import qrcode from 'qrcode-terminal';
 import {
   clearCredentials,
@@ -14,9 +15,13 @@ import {
   pollQrStatus,
   saveCredentials,
 } from './auth.js';
-import { getAutoStopBridgeOnShutdown, resolveBuildSystemPrompt } from './config.js';
+import {
+  getAutoStopBridgeOnShutdown,
+  resolveBuildSystemPrompt,
+} from './config.js';
 import { SessionExpiredError, WeixinClient } from './client.js';
 import type { IncomingMessage, QueuedWechatRequest } from './types.js';
+import { AgentMessage } from '@mariozechner/pi-agent-core/dist/types.js';
 
 type NotificationLevel = 'info' | 'warning' | 'error';
 
@@ -31,15 +36,13 @@ export default function wechatExtension(pi: ExtensionAPI) {
   let running = false;
   let agentIdle = true;
   let pollAbortController: AbortController | null = null;
-  let latestContext: ExtensionContext | ExtensionCommandContext | null = null;
+  let latestContext: ExtensionContext | null = null;
 
   const inboundQueue: QueuedWechatRequest[] = [];
   let pendingInjection: QueuedWechatRequest | null = null;
   let activeRequest: QueuedWechatRequest | null = null;
 
-  function rememberContext(
-    ctx: ExtensionContext | ExtensionCommandContext,
-  ): void {
+  function rememberContext(ctx: ExtensionContext): void {
     latestContext = ctx;
   }
 
@@ -61,10 +64,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
   }
 
   function ensureClient(): WeixinClient | null {
-    if (!client) {
-      client = loadClientFromDisk();
-    }
-    return client;
+    return (client ??= loadClientFromDisk());
   }
 
   async function stopBridge(options?: {
@@ -91,7 +91,10 @@ export default function wechatExtension(pi: ExtensionAPI) {
     }
   }
 
-  function queueIncomingMessage(message: IncomingMessage): void {
+  function queueIncomingMessage(
+    message: IncomingMessage,
+    ctx: ExtensionCommandContext,
+  ): void {
     const request: QueuedWechatRequest = {
       id: randomUUID(),
       userId: message.userId,
@@ -105,18 +108,15 @@ export default function wechatExtension(pi: ExtensionAPI) {
     if (DEBUG_LOG) {
       notify(`收到微信消息，已排队: ${request.preview}`, 'info');
     }
-    drainQueue();
+    drainQueue(ctx);
   }
 
   async function sendReply(userId: string, text: string): Promise<void> {
-    if (!client) {
-      return;
-    }
-    await client.sendTyping(userId).catch(() => {});
-    await client.sendText(userId, text);
+    await client?.sendTyping(userId).catch(() => {});
+    await client?.sendText(userId, text);
   }
 
-  async function drainQueue(): Promise<void> {
+  async function drainQueue(ctx: ExtensionCommandContext): Promise<void> {
     if (
       !running ||
       !client ||
@@ -138,8 +138,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
 
       if (modelArgs) {
         // Search for model by provider and/or model id
-        const availableModels =
-          latestContext?.modelRegistry?.getAvailable() ?? [];
+        const availableModels = ctx?.modelRegistry?.getAvailable() ?? [];
 
         // Parse input - could be "provider/id", "provider", or just partial name
         const slashIndex = modelArgs.indexOf('/');
@@ -156,7 +155,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
             next.userId,
             `模型格式错误，请使用 \`provider/model-id\` 格式`,
           );
-          drainQueue();
+          drainQueue(ctx);
           return;
         } else {
           // Has slash, split into provider and model-id
@@ -165,6 +164,12 @@ export default function wechatExtension(pi: ExtensionAPI) {
         }
 
         let matches: Array<{ provider: string; id: string; model: any }> = [];
+
+        const providerToString = (m: { provider: string; id: string }) => ({
+          provider: m.provider,
+          id: m.id,
+          model: m,
+        });
 
         if (searchByProvider) {
           // Search with provider/model-id pattern
@@ -182,12 +187,12 @@ export default function wechatExtension(pi: ExtensionAPI) {
                 : true;
               return providerMatch && idMatch;
             })
-            .map((m) => ({ provider: m.provider, id: m.id, model: m }));
+            .map(providerToString);
         } else {
           // Search by partial model id/name across all providers
           matches = availableModels
             .filter((m) => m.id.toLowerCase().includes(searchTerm))
-            .map((m) => ({ provider: m.provider, id: m.id, model: m }));
+            .map(providerToString);
         }
 
         if (matches.length === 0) {
@@ -199,13 +204,8 @@ export default function wechatExtension(pi: ExtensionAPI) {
           const matched = matches[0];
           const fullModelName = `${matched.provider}/${matched.id}`;
 
-          try {
-            await pi.setModel(matched.model);
-            await sendReply(next.userId, `已设置模型：${fullModelName}`);
-          } catch (error) {
-            const errorMessage =
-              error instanceof Error ? error.message : String(error);
-            await sendReply(next.userId, `设置模型失败：${errorMessage}`);
+          if (!(await pi.setModel(matched.model))) {
+            await sendReply(next.userId, `设置模型失败`);
           }
         } else {
           // Multiple matches, list them
@@ -225,7 +225,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
         }
       } else {
         // List available models using modelRegistry
-        const models = latestContext?.modelRegistry?.getAvailable() ?? [];
+        const models = ctx?.modelRegistry?.getAvailable() ?? [];
         if (models.length === 0) {
           await sendReply(next.userId, '没有已配置模型的可用模型');
         } else {
@@ -244,59 +244,58 @@ export default function wechatExtension(pi: ExtensionAPI) {
         }
       }
 
-      drainQueue();
+      drainQueue(ctx);
       return;
     }
 
     // Check if message starts with ! - run as shell command
     if (next.text.startsWith('!')) {
       const commandLine = next.text.slice(1).trim();
-      if (!commandLine) {
+      if (commandLine) {
+        const parts = commandLine.split(/\s+/);
+        const command = parts[0];
+        const args = parts.slice(1);
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
+        try {
+          const result = await pi.exec(command, args, {
+            signal: controller.signal,
+          });
+          const output =
+            result.stdout || result.stderr || `命令退出码：${result.code}`;
+          await sendReply(next.userId, output.trim() || '(无输出)');
+        } catch (error) {
+          const errorMessage =
+            error instanceof Error ? error.message : String(error);
+          await sendReply(next.userId, `命令执行失败：${errorMessage}`);
+        } finally {
+          clearTimeout(timeoutId);
+        }
+      } else {
         await sendReply(next.userId, '错误：！后需要跟命令');
-        drainQueue();
-        return;
       }
 
-      const parts = commandLine.split(/\s+/);
-      const command = parts[0];
-      const args = parts.slice(1);
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30_000);
-
-      try {
-        const result = await pi.exec(command, args, {
-          signal: controller.signal,
-        });
-        const output =
-          result.stdout || result.stderr || `命令退出码：${result.code}`;
-        await sendReply(next.userId, output.trim() || '(无输出)');
-      } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        await sendReply(next.userId, `命令执行失败：${errorMessage}`);
-      } finally {
-        clearTimeout(timeoutId);
-      }
-
-      drainQueue();
+      drainQueue(ctx);
       return;
     }
 
     pendingInjection = next;
     void client.sendTyping(next.userId).catch(() => {});
     pi.sendUserMessage(next.text);
+    await ctx.waitForIdle();
+    drainQueue(ctx)
   }
 
   async function completeActiveRequest(
-    messages: Array<{ role?: string; content?: unknown }>,
+    messages: AgentMessage[],
   ): Promise<void> {
     const request = activeRequest;
     activeRequest = null;
     pendingInjection = null;
 
     if (!request || !client) {
-      drainQueue();
       return;
     }
 
@@ -315,11 +314,13 @@ export default function wechatExtension(pi: ExtensionAPI) {
       notify(`发送微信回复失败: ${formatError(error)}`, 'error');
     } finally {
       await client.stopTyping(request.userId).catch(() => {});
-      drainQueue();
     }
   }
 
-  async function pollMessages(activeClient: WeixinClient): Promise<void> {
+  async function pollMessages(
+    activeClient: WeixinClient,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> {
     let retryDelayMs = POLL_RETRY_BASE_MS;
 
     while (running && client === activeClient) {
@@ -330,7 +331,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
         retryDelayMs = POLL_RETRY_BASE_MS;
 
         for (const message of messages) {
-          queueIncomingMessage(message);
+          queueIncomingMessage(message, ctx);
         }
       } catch (error) {
         if (isAbortError(error)) {
@@ -352,8 +353,6 @@ export default function wechatExtension(pi: ExtensionAPI) {
   pi.registerCommand('wechat-login', {
     description: '扫码登录微信 iLink Bot',
     handler: async (args, ctx) => {
-      rememberContext(ctx);
-
       const force = args.split(/\s+/).some((part) => part === '--force');
       if (!force) {
         const cached = loadClientFromDisk();
@@ -414,8 +413,6 @@ export default function wechatExtension(pi: ExtensionAPI) {
   pi.registerCommand('wechat-start', {
     description: '启动微信消息桥接',
     handler: async (_args, ctx) => {
-      rememberContext(ctx);
-
       const activeClient = ensureClient();
       if (!activeClient) {
         notify('未找到微信凭证，请先执行 /wechat-login', 'error');
@@ -430,9 +427,9 @@ export default function wechatExtension(pi: ExtensionAPI) {
       running = true;
       pollAbortController = new AbortController();
       notify('微信桥接已启动', 'info');
-      drainQueue();
+      drainQueue(ctx);
 
-      void pollMessages(activeClient).finally(() => {
+      void pollMessages(activeClient, ctx).finally(() => {
         if (pollAbortController?.signal.aborted) {
           pollAbortController = null;
         }
@@ -443,7 +440,6 @@ export default function wechatExtension(pi: ExtensionAPI) {
   pi.registerCommand('wechat-stop', {
     description: '停止微信消息桥接',
     handler: async (_args, ctx) => {
-      rememberContext(ctx);
       await stopBridge();
       notify('微信桥接已停止', 'info');
     },
@@ -452,7 +448,6 @@ export default function wechatExtension(pi: ExtensionAPI) {
   pi.registerCommand('wechat-logout', {
     description: '清除微信凭证并停止桥接',
     handler: async (_args, ctx) => {
-      rememberContext(ctx);
       await stopBridge({ clearClient: true });
       clearCredentials();
       notify(`已清除微信凭证: ${getCredentialsPath()}`, 'info');
@@ -511,9 +506,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
   pi.on('agent_end', async (event, ctx) => {
     rememberContext(ctx);
     agentIdle = true;
-    await completeActiveRequest(
-      event.messages as Array<{ role?: string; content?: unknown }>,
-    );
+    await completeActiveRequest(event.messages);
   });
 
   pi.on('session_shutdown', async (_event, ctx) => {
@@ -542,20 +535,14 @@ async function renderQrCode(url: string): Promise<string> {
   });
 }
 
-function extractFinalAssistantText(
-  messages: Array<{ role?: string; content?: unknown }>,
-) {
+function extractFinalAssistantText(messages: AgentMessage[]) {
   return messages
-    .findLast(
-      (message): message is { role: 'assistant'; content: Array<unknown> } => {
-        return message?.role === 'assistant' && Array.isArray(message.content);
-      },
-    )
-    ?.content.filter((part): part is { type: 'text'; text: string } => {
+    .findLast((message): message is AssistantMessage => {
+      return message?.role === 'assistant';
+    })
+    ?.content.filter((part)=> {
       return (
-        typeof part === 'object' &&
-        part !== null &&
-        (part as { type?: string }).type === 'text'
+        part.type === 'text'
       );
     })
     .map((part) => part.text.trim())
