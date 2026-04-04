@@ -45,7 +45,7 @@ export function saveStoredConfig(config: StoredConfig): void {
   fs.writeFileSync(
     getConfigPath(),
     JSON.stringify(config, null, 2),
-    { mode: 0o600 }
+    { mode: 0o6_0_0 }
   )
 }
 

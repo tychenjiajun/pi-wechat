@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionContext,
+import {
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
 } from '@mariozechner/pi-coding-agent';
 import { AssistantMessage } from '@mariozechner/pi-ai';
 import qrcode from 'qrcode-terminal';
@@ -15,10 +15,7 @@ import {
   pollQrStatus,
   saveCredentials,
 } from './auth.js';
-import {
-  getAutoStopBridgeOnShutdown,
-  resolveBuildSystemPrompt,
-} from './config.js';
+import { resolveBuildSystemPrompt } from './config.js';
 import { SessionExpiredError, WeixinClient } from './client.js';
 import type { IncomingMessage, QueuedWechatRequest } from './types.js';
 import { AgentMessage } from '@mariozechner/pi-agent-core/dist/types.js';
@@ -33,14 +30,24 @@ const DEBUG_LOG = process.env.PI_WECHAT_DEBUG === '1';
 
 export default function wechatExtension(pi: ExtensionAPI) {
   let client: WeixinClient | null = null;
-  let running = false;
-  let agentIdle = true;
   let pollAbortController: AbortController | null = null;
   let latestContext: ExtensionContext | null = null;
 
   const inboundQueue: QueuedWechatRequest[] = [];
   let pendingInjection: QueuedWechatRequest | null = null;
   let activeRequest: QueuedWechatRequest | null = null;
+  let queueBarrierOpen: ((value: void | PromiseLike<void>) => void) | null =
+    null;
+  let agentBarrierOpen: ((value: void | PromiseLike<void>) => void) | null =
+    null;
+  let agentBarrier: Promise<void> | null = null;
+  let queueBarrier: Promise<void> | null = new Promise((resolve) => {
+    queueBarrierOpen = resolve;
+  });
+
+  function isRunning() {
+    return pollAbortController != null;
+  }
 
   function rememberContext(ctx: ExtensionContext): void {
     latestContext = ctx;
@@ -71,7 +78,6 @@ export default function wechatExtension(pi: ExtensionAPI) {
     clearClient?: boolean;
     clearQueue?: boolean;
   }): Promise<void> {
-    running = false;
     pollAbortController?.abort();
     pollAbortController = null;
 
@@ -91,10 +97,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
     }
   }
 
-  function queueIncomingMessage(
-    message: IncomingMessage,
-    ctx: ExtensionCommandContext,
-  ): void {
+  function queueIncomingMessage(message: IncomingMessage): void {
     const request: QueuedWechatRequest = {
       id: randomUUID(),
       userId: message.userId,
@@ -105,10 +108,10 @@ export default function wechatExtension(pi: ExtensionAPI) {
     };
 
     inboundQueue.push(request);
+    queueBarrierOpen?.();
     if (DEBUG_LOG) {
       notify(`收到微信消息，已排队: ${request.preview}`, 'info');
     }
-    drainQueue(ctx);
   }
 
   async function sendReply(userId: string, text: string): Promise<void> {
@@ -117,24 +120,46 @@ export default function wechatExtension(pi: ExtensionAPI) {
   }
 
   async function drainQueue(ctx: ExtensionCommandContext): Promise<void> {
-    if (
-      !running ||
-      !client ||
-      !agentIdle ||
-      pendingInjection ||
-      activeRequest
-    ) {
+    if (!isRunning() || !client) {
       return;
     }
+
+    await Promise.all([
+      agentBarrier ?? Promise.resolve(),
+      queueBarrier ?? Promise.resolve(),
+    ]);
 
     const next = inboundQueue.shift();
     if (!next) {
       return;
     }
 
+    if (inboundQueue.length === 0) {
+      queueBarrier = new Promise((resolve) => {
+        queueBarrierOpen = resolve;
+      });
+    }
+
+    // Check if message starts with /new - start new session
+    if (next.text.trim() === '/new') {
+      try {
+        latestContext = null;
+        const result = await ctx.newSession();
+        if (result.cancelled) {
+          await sendReply(next.userId, '新会话已取消');
+        } else {
+          await sendReply(next.userId, '已开始新会话');
+        }
+      } catch (error) {
+        await sendReply(next.userId, `启动新会话失败: ${formatError(error)}`);
+      }
+      drainQueue(ctx);
+      return;
+    }
+
     // Check if message starts with /model - handle model selection
-    if (next.text.startsWith('/model')) {
-      const modelArgs = next.text.slice(6).trim();
+    if (next.text.trim().startsWith('/model')) {
+      const modelArgs = next.text.trim().slice(6).trim();
 
       if (modelArgs) {
         // Search for model by provider and/or model id
@@ -249,7 +274,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
     }
 
     // Check if message starts with ! - run as shell command
-    if (next.text.startsWith('!')) {
+    if (next.text.trim().startsWith('!')) {
       const commandLine = next.text.slice(1).trim();
       if (commandLine) {
         const parts = commandLine.split(/\s+/);
@@ -281,11 +306,14 @@ export default function wechatExtension(pi: ExtensionAPI) {
       return;
     }
 
+    agentBarrier = new Promise((resolve) => {
+      agentBarrierOpen = resolve;
+    });
+
     pendingInjection = next;
     void client.sendTyping(next.userId).catch(() => {});
     pi.sendUserMessage(next.text);
-    await ctx.waitForIdle();
-    drainQueue(ctx)
+    drainQueue(ctx);
   }
 
   async function completeActiveRequest(
@@ -296,6 +324,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
     pendingInjection = null;
 
     if (!request || !client) {
+      agentBarrierOpen?.();
       return;
     }
 
@@ -314,16 +343,14 @@ export default function wechatExtension(pi: ExtensionAPI) {
       notify(`发送微信回复失败: ${formatError(error)}`, 'error');
     } finally {
       await client.stopTyping(request.userId).catch(() => {});
+      agentBarrierOpen?.();
     }
   }
 
-  async function pollMessages(
-    activeClient: WeixinClient,
-    ctx: ExtensionCommandContext,
-  ): Promise<void> {
+  async function pollMessages(activeClient: WeixinClient): Promise<void> {
     let retryDelayMs = POLL_RETRY_BASE_MS;
 
-    while (running && client === activeClient) {
+    while (isRunning() && client === activeClient) {
       try {
         const messages = await activeClient.getUpdates(
           pollAbortController?.signal,
@@ -331,7 +358,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
         retryDelayMs = POLL_RETRY_BASE_MS;
 
         for (const message of messages) {
-          queueIncomingMessage(message, ctx);
+          queueIncomingMessage(message);
         }
       } catch (error) {
         if (isAbortError(error)) {
@@ -363,7 +390,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
         }
       }
 
-      if (running) {
+      if (isRunning()) {
         await stopBridge();
       }
 
@@ -419,17 +446,16 @@ export default function wechatExtension(pi: ExtensionAPI) {
         return;
       }
 
-      if (running) {
+      if (isRunning()) {
         notify('微信桥接已经在运行', 'info');
         return;
       }
 
-      running = true;
       pollAbortController = new AbortController();
       notify('微信桥接已启动', 'info');
       drainQueue(ctx);
 
-      void pollMessages(activeClient, ctx).finally(() => {
+      void pollMessages(activeClient).finally(() => {
         if (pollAbortController?.signal.aborted) {
           pollAbortController = null;
         }
@@ -461,7 +487,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
 
       const activeClient = client ?? loadClientFromDisk();
       const lines = [
-        `运行状态: ${running ? 'running' : 'stopped'}`,
+        `运行状态: ${isRunning() ? 'running' : 'stopped'}`,
         `凭证状态: ${activeClient ? 'ready' : 'missing'}`,
         `账号 ID: ${activeClient?.accountId ?? '-'}`,
         `用户 ID: ${activeClient?.userId ?? '-'}`,
@@ -488,6 +514,10 @@ export default function wechatExtension(pi: ExtensionAPI) {
       return;
     }
 
+    agentBarrier ??= new Promise((resolve) => {
+      agentBarrierOpen = resolve;
+    });
+
     return {
       systemPrompt: resolveBuildSystemPrompt(event.systemPrompt, request),
     };
@@ -495,7 +525,6 @@ export default function wechatExtension(pi: ExtensionAPI) {
 
   pi.on('agent_start', async (_event, ctx) => {
     rememberContext(ctx);
-    agentIdle = false;
 
     if (pendingInjection) {
       activeRequest = pendingInjection;
@@ -505,17 +534,13 @@ export default function wechatExtension(pi: ExtensionAPI) {
 
   pi.on('agent_end', async (event, ctx) => {
     rememberContext(ctx);
-    agentIdle = true;
     await completeActiveRequest(event.messages);
   });
 
-  pi.on('session_shutdown', async (_event, ctx) => {
-    rememberContext(ctx);
-    const autoStop = getAutoStopBridgeOnShutdown();
-    if (autoStop) {
-      await stopBridge();
-    }
-  });
+  // pi.on('session_shutdown', async (_event, ctx) => {
+  //   rememberContext(ctx);
+  //   await stopBridge();
+  // });
 
   pi.on('model_select', async (event, ctx) => {
     rememberContext(ctx);
@@ -540,10 +565,8 @@ function extractFinalAssistantText(messages: AgentMessage[]) {
     .findLast((message): message is AssistantMessage => {
       return message?.role === 'assistant';
     })
-    ?.content.filter((part)=> {
-      return (
-        part.type === 'text'
-      );
+    ?.content.filter((part) => {
+      return part.type === 'text';
     })
     .map((part) => part.text.trim())
     .filter(Boolean)
