@@ -14,7 +14,7 @@ import {
   pollQrStatus,
   saveCredentials,
 } from './auth.js';
-import { resolveBuildSystemPrompt } from './config.js';
+import { getAutoStopBridgeOnShutdown, resolveBuildSystemPrompt } from './config.js';
 import { SessionExpiredError, WeixinClient } from './client.js';
 import type { IncomingMessage, QueuedWechatRequest } from './types.js';
 
@@ -136,18 +136,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
     if (next.text.startsWith('/model')) {
       const modelArgs = next.text.slice(6).trim();
 
-      if (!modelArgs) {
-        // List available models using modelRegistry
-        const models = latestContext?.modelRegistry?.getAvailable() ?? [];
-        if (models.length === 0) {
-          await sendReply(next.userId, '没有已配置模型的可用模型');
-        } else {
-          const modelList = models
-            .map((m) => `${m.provider}/${m.id} (${m.name})`)
-            .join('\n');
-          await sendReply(next.userId, `已配置模型:\n\n${modelList}`);
-        }
-      } else {
+      if (modelArgs) {
         // Search for model by provider and/or model id
         const availableModels =
           latestContext?.modelRegistry?.getAvailable() ?? [];
@@ -177,12 +166,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
 
         let matches: Array<{ provider: string; id: string; model: any }> = [];
 
-        if (!searchByProvider) {
-          // Search by partial model id/name across all providers
-          matches = availableModels
-            .filter((m) => m.id.toLowerCase().includes(searchTerm))
-            .map((m) => ({ provider: m.provider, id: m.id, model: m }));
-        } else {
+        if (searchByProvider) {
           // Search with provider/model-id pattern
           const parts = modelArgs.split('/');
           const providerPart = parts[0].toLowerCase();
@@ -198,6 +182,11 @@ export default function wechatExtension(pi: ExtensionAPI) {
                 : true;
               return providerMatch && idMatch;
             })
+            .map((m) => ({ provider: m.provider, id: m.id, model: m }));
+        } else {
+          // Search by partial model id/name across all providers
+          matches = availableModels
+            .filter((m) => m.id.toLowerCase().includes(searchTerm))
             .map((m) => ({ provider: m.provider, id: m.id, model: m }));
         }
 
@@ -232,6 +221,25 @@ export default function wechatExtension(pi: ExtensionAPI) {
           await sendReply(
             next.userId,
             `找到 ${matches.length} 个匹配的模型:\n\n${modelList}${extraInfo}\n\n请使用完整名称选择，如: \`${matches[0].provider}/${matches[0].id}\``,
+          );
+        }
+      } else {
+        // List available models using modelRegistry
+        const models = latestContext?.modelRegistry?.getAvailable() ?? [];
+        if (models.length === 0) {
+          await sendReply(next.userId, '没有已配置模型的可用模型');
+        } else {
+          const limitedModels = models.slice(0, 10);
+          const modelList = limitedModels
+            .map((m) => `${m.provider}/${m.id} (${m.name})`)
+            .join('\n');
+          const extraInfo =
+            models.length > 10
+              ? `\n\n还有 ${models.length - 10} 个模型...`
+              : '';
+          await sendReply(
+            next.userId,
+            `已配置模型:\n\n${modelList}${extraInfo}`,
           );
         }
       }
@@ -510,7 +518,10 @@ export default function wechatExtension(pi: ExtensionAPI) {
 
   pi.on('session_shutdown', async (_event, ctx) => {
     rememberContext(ctx);
-    await stopBridge();
+    const autoStop = getAutoStopBridgeOnShutdown();
+    if (autoStop) {
+      await stopBridge();
+    }
   });
 
   pi.on('model_select', async (event, ctx) => {
