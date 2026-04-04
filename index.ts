@@ -537,10 +537,10 @@ export default function wechatExtension(pi: ExtensionAPI) {
     await completeActiveRequest(event.messages);
   });
 
-  // pi.on('session_shutdown', async (_event, ctx) => {
-  //   rememberContext(ctx);
-  //   await stopBridge();
-  // });
+  pi.on('session_shutdown', async (_event, ctx) => {
+    rememberContext(ctx);
+    await stopBridge();
+  });
 
   pi.on('model_select', async (event, ctx) => {
     rememberContext(ctx);
