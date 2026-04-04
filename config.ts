@@ -12,6 +12,8 @@ const CONFIG_JS_FILE = 'config.js'
 
 export interface StoredConfig {
   buildSystemPrompt?: boolean | string
+  maxTextChunk?: number
+  autoStopBridgeOnShutdown?: boolean
 }
 
 export interface PiWechatConfig {
@@ -60,6 +62,16 @@ export function loadCustomPromptBuilder(): ((basePrompt: string, request: Queued
     // Ignore errors
   }
   return null
+}
+
+export function getMaxTextChunk(): number {
+  const stored = loadStoredConfig()
+  return stored.maxTextChunk ?? 2_000
+}
+
+export function getAutoStopBridgeOnShutdown(): boolean {
+  const stored = loadStoredConfig()
+  return stored.autoStopBridgeOnShutdown ?? true
 }
 
 export function resolveBuildSystemPrompt(
