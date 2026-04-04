@@ -550,7 +550,7 @@ export default function wechatExtension(pi: ExtensionAPI) {
       : 'none';
     const next = `${event.model.provider}/${event.model.id}`;
 
-    notify(`模型已更改 (${event.source}): ${prev} -> ${next}`, 'info');
+    sendReply(`模型已更改 (${event.source}): ${prev} -> ${next}`, 'info');
   });
 }
 
