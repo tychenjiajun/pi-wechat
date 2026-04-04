@@ -1,102 +1,94 @@
-import { randomUUID } from 'node:crypto'
-import { setTimeout as delay } from 'node:timers/promises'
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@mariozechner/pi-coding-agent'
-import qrcode from 'qrcode-terminal'
-import { clearCredentials, getCredentialsPath, getQrCode, loadCredentials, pollQrStatus, saveCredentials } from './auth.js'
-import { SessionExpiredError, WeixinClient } from './client.js'
-import type { IncomingMessage } from './types.js'
+import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+} from '@mariozechner/pi-coding-agent';
+import qrcode from 'qrcode-terminal';
+import {
+  clearCredentials,
+  getCredentialsPath,
+  getQrCode,
+  loadCredentials,
+  pollQrStatus,
+  saveCredentials,
+} from './auth.js';
+import { resolveBuildSystemPrompt } from './config.js';
+import { SessionExpiredError, WeixinClient } from './client.js';
+import type { IncomingMessage, QueuedWechatRequest } from './types.js';
 
-type NotificationLevel = 'info' | 'warning' | 'error'
+type NotificationLevel = 'info' | 'warning' | 'error';
 
-interface QueuedWechatRequest {
-  id: string
-  userId: string
-  messageId: string
-  receivedAt: Date
-  text: string
-  preview: string
-}
-
-const POLL_RETRY_BASE_MS = 1_000
-const POLL_RETRY_MAX_MS = 10_000
-const QR_POLL_INTERVAL_MS = 2_000
-const PREVIEW_LIMIT = 60
-const DEBUG_LOG = process.env.PI_WECHAT_DEBUG === '1'
+const POLL_RETRY_BASE_MS = 1_000;
+const POLL_RETRY_MAX_MS = 10_000;
+const QR_POLL_INTERVAL_MS = 2_000;
+const PREVIEW_LIMIT = 60;
+const DEBUG_LOG = process.env.PI_WECHAT_DEBUG === '1';
 
 export default function wechatExtension(pi: ExtensionAPI) {
-  let client: WeixinClient | null = null
-  let running = false
-  let agentIdle = true
-  let pollAbortController: AbortController | null = null
-  let latestContext: ExtensionContext | ExtensionCommandContext | null = null
+  let client: WeixinClient | null = null;
+  let running = false;
+  let agentIdle = true;
+  let pollAbortController: AbortController | null = null;
+  let latestContext: ExtensionContext | ExtensionCommandContext | null = null;
 
-  const inboundQueue: QueuedWechatRequest[] = []
-  let pendingInjection: QueuedWechatRequest | null = null
-  let activeRequest: QueuedWechatRequest | null = null
+  const inboundQueue: QueuedWechatRequest[] = [];
+  let pendingInjection: QueuedWechatRequest | null = null;
+  let activeRequest: QueuedWechatRequest | null = null;
 
-  function rememberContext(ctx: ExtensionContext | ExtensionCommandContext): void {
-    latestContext = ctx
+  function rememberContext(
+    ctx: ExtensionContext | ExtensionCommandContext,
+  ): void {
+    latestContext = ctx;
   }
 
   function notify(message: string, level: NotificationLevel = 'info'): void {
     if (latestContext?.hasUI) {
-      latestContext.ui.notify(message, level)
+      latestContext.ui.notify(message, level);
       if (!DEBUG_LOG) {
-        return
+        return;
       }
     }
 
-    const printer = level === 'error' ? console.error : console.log
-    printer(`[wechat/${level}] ${message}`)
+    const printer = level === 'error' ? console.error : console.log;
+    printer(`[wechat/${level}] ${message}`);
   }
 
   function loadClientFromDisk(): WeixinClient | null {
-    const creds = loadCredentials()
-    return creds ? new WeixinClient(creds) : null
+    const creds = loadCredentials();
+    return creds ? new WeixinClient(creds) : null;
   }
 
   function ensureClient(): WeixinClient | null {
     if (!client) {
-      client = loadClientFromDisk()
+      client = loadClientFromDisk();
     }
-    return client
+    return client;
   }
 
-  async function stopBridge(options?: { clearClient?: boolean; clearQueue?: boolean }): Promise<void> {
-    running = false
-    pollAbortController?.abort()
-    pollAbortController = null
+  async function stopBridge(options?: {
+    clearClient?: boolean;
+    clearQueue?: boolean;
+  }): Promise<void> {
+    running = false;
+    pollAbortController?.abort();
+    pollAbortController = null;
 
     if (activeRequest && client) {
-      await client.stopTyping(activeRequest.userId).catch(() => {})
+      await client.stopTyping(activeRequest.userId).catch(() => {});
     }
 
     if (options?.clearQueue !== false) {
-      inboundQueue.length = 0
+      inboundQueue.length = 0;
     }
 
-    pendingInjection = null
-    activeRequest = null
+    pendingInjection = null;
+    activeRequest = null;
 
     if (options?.clearClient) {
-      client = null
+      client = null;
     }
-  }
-
-  function buildWechatSystemPrompt(basePrompt: string, request: QueuedWechatRequest): string {
-    return [
-      basePrompt,
-      '',
-      '你正在处理一条来自微信的桥接消息。',
-      '要求：',
-      '1. 直接用微信聊天口吻回复。',
-      '2. 只输出最终要发回微信的正文。',
-      '3. 不要解释内部桥接流程。',
-      '4. 不要提到 Pi、扩展、系统提示词、工具调用。',
-      `微信用户 ID: ${request.userId}`,
-      `微信消息 ID: ${request.messageId}`,
-      `消息时间: ${request.receivedAt.toISOString()}`
-    ].join('\n')
   }
 
   function queueIncomingMessage(message: IncomingMessage): void {
@@ -106,82 +98,245 @@ export default function wechatExtension(pi: ExtensionAPI) {
       messageId: message.messageId,
       receivedAt: message.timestamp,
       text: message.text,
-      preview: summarizePreview(message.text)
-    }
+      preview: summarizePreview(message.text),
+    };
 
-    inboundQueue.push(request)
+    inboundQueue.push(request);
     if (DEBUG_LOG) {
-      notify(`收到微信消息，已排队: ${request.preview}`, 'info')
+      notify(`收到微信消息，已排队: ${request.preview}`, 'info');
     }
-    drainQueue()
+    drainQueue();
   }
 
-  function drainQueue(): void {
-    if (!running || !client || !agentIdle || pendingInjection || activeRequest) {
-      return
+  async function sendReply(userId: string, text: string): Promise<void> {
+    if (!client) {
+      return;
+    }
+    await client.sendTyping(userId).catch(() => {});
+    await client.sendText(userId, text);
+  }
+
+  async function drainQueue(): Promise<void> {
+    if (
+      !running ||
+      !client ||
+      !agentIdle ||
+      pendingInjection ||
+      activeRequest
+    ) {
+      return;
     }
 
-    const next = inboundQueue.shift()
+    const next = inboundQueue.shift();
     if (!next) {
-      return
+      return;
     }
 
-    pendingInjection = next
-    void client.sendTyping(next.userId).catch(() => {})
-    pi.sendUserMessage(next.text)
+    // Check if message starts with /model - handle model selection
+    if (next.text.startsWith('/model')) {
+      const modelArgs = next.text.slice(6).trim();
+
+      if (!modelArgs) {
+        // List available models using modelRegistry
+        const models = latestContext?.modelRegistry?.getAvailable() ?? [];
+        if (models.length === 0) {
+          await sendReply(next.userId, '没有已配置模型的可用模型');
+        } else {
+          const modelList = models
+            .map((m) => `${m.provider}/${m.id} (${m.name})`)
+            .join('\n');
+          await sendReply(next.userId, `已配置模型:\n\n${modelList}`);
+        }
+      } else {
+        // Search for model by provider and/or model id
+        const availableModels =
+          latestContext?.modelRegistry?.getAvailable() ?? [];
+
+        // Parse input - could be "provider/id", "provider", or just partial name
+        const slashIndex = modelArgs.indexOf('/');
+        let searchTerm: string;
+        let searchByProvider: boolean;
+
+        if (slashIndex === -1) {
+          // No slash, search by partial model name across all providers
+          searchTerm = modelArgs.toLowerCase();
+          searchByProvider = false;
+        } else if (slashIndex === 0) {
+          // Starts with slash, invalid
+          await sendReply(
+            next.userId,
+            `模型格式错误，请使用 \`provider/model-id\` 格式`,
+          );
+          drainQueue();
+          return;
+        } else {
+          // Has slash, split into provider and model-id
+          searchTerm = modelArgs.toLowerCase();
+          searchByProvider = true;
+        }
+
+        let matches: Array<{ provider: string; id: string; model: any }> = [];
+
+        if (!searchByProvider) {
+          // Search by partial model id/name across all providers
+          matches = availableModels
+            .filter((m) => m.id.toLowerCase().includes(searchTerm))
+            .map((m) => ({ provider: m.provider, id: m.id, model: m }));
+        } else {
+          // Search with provider/model-id pattern
+          const parts = modelArgs.split('/');
+          const providerPart = parts[0].toLowerCase();
+          const modelIdPart = parts.slice(1).join('/').toLowerCase();
+
+          matches = availableModels
+            .filter((m) => {
+              const providerMatch = m.provider
+                .toLowerCase()
+                .includes(providerPart);
+              const idMatch = modelIdPart
+                ? m.id.toLowerCase().includes(modelIdPart)
+                : true;
+              return providerMatch && idMatch;
+            })
+            .map((m) => ({ provider: m.provider, id: m.id, model: m }));
+        }
+
+        if (matches.length === 0) {
+          await sendReply(
+            next.userId,
+            `未找到匹配的模型：\`${modelArgs}\`\n\n请使用 /model 查看可用模型列表`,
+          );
+        } else if (matches.length === 1) {
+          const matched = matches[0];
+          const fullModelName = `${matched.provider}/${matched.id}`;
+
+          try {
+            await pi.setModel(matched.model);
+            await sendReply(next.userId, `已设置模型：${fullModelName}`);
+          } catch (error) {
+            const errorMessage =
+              error instanceof Error ? error.message : String(error);
+            await sendReply(next.userId, `设置模型失败：${errorMessage}`);
+          }
+        } else {
+          // Multiple matches, list them
+          const modelList = matches
+            .slice(0, 10)
+            .map((m) => `- ${m.provider}/${m.id}`)
+            .join('\n');
+          const extraInfo =
+            matches.length > 10
+              ? `\n\n还有 ${matches.length - 10} 个匹配...`
+              : '';
+
+          await sendReply(
+            next.userId,
+            `找到 ${matches.length} 个匹配的模型:\n\n${modelList}${extraInfo}\n\n请使用完整名称选择，如: \`${matches[0].provider}/${matches[0].id}\``,
+          );
+        }
+      }
+
+      drainQueue();
+      return;
+    }
+
+    // Check if message starts with ! - run as shell command
+    if (next.text.startsWith('!')) {
+      const commandLine = next.text.slice(1).trim();
+      if (!commandLine) {
+        await sendReply(next.userId, '错误：！后需要跟命令');
+        drainQueue();
+        return;
+      }
+
+      const parts = commandLine.split(/\s+/);
+      const command = parts[0];
+      const args = parts.slice(1);
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
+      try {
+        const result = await pi.exec(command, args, {
+          signal: controller.signal,
+        });
+        const output =
+          result.stdout || result.stderr || `命令退出码：${result.code}`;
+        await sendReply(next.userId, output.trim() || '(无输出)');
+      } catch (error) {
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
+        await sendReply(next.userId, `命令执行失败：${errorMessage}`);
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
+      drainQueue();
+      return;
+    }
+
+    pendingInjection = next;
+    void client.sendTyping(next.userId).catch(() => {});
+    pi.sendUserMessage(next.text);
   }
 
-  async function completeActiveRequest(messages: Array<{ role?: string; content?: unknown }>): Promise<void> {
-    const request = activeRequest
-    activeRequest = null
-    pendingInjection = null
+  async function completeActiveRequest(
+    messages: Array<{ role?: string; content?: unknown }>,
+  ): Promise<void> {
+    const request = activeRequest;
+    activeRequest = null;
+    pendingInjection = null;
 
     if (!request || !client) {
-      drainQueue()
-      return
+      drainQueue();
+      return;
     }
 
-    const reply = extractFinalAssistantText(messages)
+    const reply = extractFinalAssistantText(messages);
 
     try {
       if (reply) {
-        await client.sendText(request.userId, reply)
+        await client.sendText(request.userId, reply);
       } else {
-        notify(`Pi 没有产出可发送的文本回复，已跳过: ${request.preview}`, 'warning')
+        notify(
+          `Pi 没有产出可发送的文本回复，已跳过: ${request.preview}`,
+          'warning',
+        );
       }
     } catch (error) {
-      notify(`发送微信回复失败: ${formatError(error)}`, 'error')
+      notify(`发送微信回复失败: ${formatError(error)}`, 'error');
     } finally {
-      await client.stopTyping(request.userId).catch(() => {})
-      drainQueue()
+      await client.stopTyping(request.userId).catch(() => {});
+      drainQueue();
     }
   }
 
   async function pollMessages(activeClient: WeixinClient): Promise<void> {
-    let retryDelayMs = POLL_RETRY_BASE_MS
+    let retryDelayMs = POLL_RETRY_BASE_MS;
 
     while (running && client === activeClient) {
       try {
-        const messages = await activeClient.getUpdates(pollAbortController?.signal)
-        retryDelayMs = POLL_RETRY_BASE_MS
+        const messages = await activeClient.getUpdates(
+          pollAbortController?.signal,
+        );
+        retryDelayMs = POLL_RETRY_BASE_MS;
 
         for (const message of messages) {
-          queueIncomingMessage(message)
+          queueIncomingMessage(message);
         }
       } catch (error) {
         if (isAbortError(error)) {
-          break
+          break;
         }
 
         if (error instanceof SessionExpiredError) {
-          notify('微信 session 已过期，请重新执行 /wechat-login', 'error')
-          await stopBridge({ clearQueue: false })
-          break
+          notify('微信 session 已过期，请重新执行 /wechat-login', 'error');
+          await stopBridge({ clearQueue: false });
+          break;
         }
 
-        notify(`微信轮询失败: ${formatError(error)}`, 'warning')
-        await delay(retryDelayMs)
-        retryDelayMs = Math.min(retryDelayMs * 2, POLL_RETRY_MAX_MS)
+        await delay(retryDelayMs);
+        retryDelayMs = Math.min(retryDelayMs * 2, POLL_RETRY_MAX_MS);
       }
     }
   }
@@ -189,115 +344,119 @@ export default function wechatExtension(pi: ExtensionAPI) {
   pi.registerCommand('wechat-login', {
     description: '扫码登录微信 iLink Bot',
     handler: async (args, ctx) => {
-      rememberContext(ctx)
+      rememberContext(ctx);
 
-      const force = args.split(/\s+/).some((part) => part === '--force')
+      const force = args.split(/\s+/).some((part) => part === '--force');
       if (!force) {
-        const cached = loadClientFromDisk()
+        const cached = loadClientFromDisk();
         if (cached) {
-          client = cached
-          notify(`已加载本地微信凭证: ${getCredentialsPath()}`, 'info')
-          return
+          client = cached;
+          notify(`已加载本地微信凭证: ${getCredentialsPath()}`, 'info');
+          return;
         }
       }
 
       if (running) {
-        await stopBridge()
+        await stopBridge();
       }
 
       try {
-        const qr = await getQrCode()
-        const qrText = await renderQrCode(qr.url)
-        notify(`请用微信扫码登录：\n\n${qrText}\n\n二维码链接：${qr.url}`, 'info')
+        const qr = await getQrCode();
+        const qrText = await renderQrCode(qr.url);
+        notify(
+          `请用微信扫码登录：\n\n${qrText}\n\n二维码链接：${qr.url}`,
+          'info',
+        );
 
-        let lastStatus: 'wait' | 'scaned' | 'confirmed' | 'expired' | null = null
+        let lastStatus: 'wait' | 'scaned' | 'confirmed' | 'expired' | null =
+          null;
 
         while (true) {
-          await delay(QR_POLL_INTERVAL_MS)
-          const result = await pollQrStatus(qr.token)
+          await delay(QR_POLL_INTERVAL_MS);
+          const result = await pollQrStatus(qr.token);
 
           if (result.status === lastStatus) {
-            continue
+            continue;
           }
-          lastStatus = result.status
+          lastStatus = result.status;
 
           if (result.status === 'scaned') {
-            notify('已扫码，请在手机上确认登录', 'info')
-            continue
+            notify('已扫码，请在手机上确认登录', 'info');
+            continue;
           }
 
           if (result.status === 'confirmed' && result.credentials) {
-            saveCredentials(result.credentials)
-            client = new WeixinClient(result.credentials)
-            notify('微信登录成功', 'info')
-            return
+            saveCredentials(result.credentials);
+            client = new WeixinClient(result.credentials);
+            notify('微信登录成功', 'info');
+            return;
           }
 
           if (result.status === 'expired') {
-            notify('二维码已过期，请重新执行 /wechat-login', 'error')
-            return
+            notify('二维码已过期，请重新执行 /wechat-login', 'error');
+            return;
           }
         }
       } catch (error) {
-        notify(`微信登录失败: ${formatError(error)}`, 'error')
+        notify(`微信登录失败: ${formatError(error)}`, 'error');
       }
-    }
-  })
+    },
+  });
 
   pi.registerCommand('wechat-start', {
     description: '启动微信消息桥接',
     handler: async (_args, ctx) => {
-      rememberContext(ctx)
+      rememberContext(ctx);
 
-      const activeClient = ensureClient()
+      const activeClient = ensureClient();
       if (!activeClient) {
-        notify('未找到微信凭证，请先执行 /wechat-login', 'error')
-        return
+        notify('未找到微信凭证，请先执行 /wechat-login', 'error');
+        return;
       }
 
       if (running) {
-        notify('微信桥接已经在运行', 'info')
-        return
+        notify('微信桥接已经在运行', 'info');
+        return;
       }
 
-      running = true
-      pollAbortController = new AbortController()
-      notify('微信桥接已启动', 'info')
-      drainQueue()
+      running = true;
+      pollAbortController = new AbortController();
+      notify('微信桥接已启动', 'info');
+      drainQueue();
 
       void pollMessages(activeClient).finally(() => {
         if (pollAbortController?.signal.aborted) {
-          pollAbortController = null
+          pollAbortController = null;
         }
-      })
-    }
-  })
+      });
+    },
+  });
 
   pi.registerCommand('wechat-stop', {
     description: '停止微信消息桥接',
     handler: async (_args, ctx) => {
-      rememberContext(ctx)
-      await stopBridge()
-      notify('微信桥接已停止', 'info')
-    }
-  })
+      rememberContext(ctx);
+      await stopBridge();
+      notify('微信桥接已停止', 'info');
+    },
+  });
 
   pi.registerCommand('wechat-logout', {
     description: '清除微信凭证并停止桥接',
     handler: async (_args, ctx) => {
-      rememberContext(ctx)
-      await stopBridge({ clearClient: true })
-      clearCredentials()
-      notify(`已清除微信凭证: ${getCredentialsPath()}`, 'info')
-    }
-  })
+      rememberContext(ctx);
+      await stopBridge({ clearClient: true });
+      clearCredentials();
+      notify(`已清除微信凭证: ${getCredentialsPath()}`, 'info');
+    },
+  });
 
   pi.registerCommand('wechat-status', {
     description: '查看微信桥接状态',
     handler: async (_args, ctx) => {
-      rememberContext(ctx)
+      rememberContext(ctx);
 
-      const activeClient = client ?? loadClientFromDisk()
+      const activeClient = client ?? loadClientFromDisk();
       const lines = [
         `运行状态: ${running ? 'running' : 'stopped'}`,
         `凭证状态: ${activeClient ? 'ready' : 'missing'}`,
@@ -306,96 +465,107 @@ export default function wechatExtension(pi: ExtensionAPI) {
         `排队消息: ${inboundQueue.length}`,
         `等待注入: ${pendingInjection ? pendingInjection.preview : '-'}`,
         `处理中: ${activeRequest ? activeRequest.preview : '-'}`,
-        `凭证路径: ${getCredentialsPath()}`
-      ]
+        `凭证路径: ${getCredentialsPath()}`,
+      ];
 
-      notify(lines.join('\n'), 'info')
-    }
-  })
+      notify(lines.join('\n'), 'info');
+    },
+  });
 
   pi.on('session_start', async (_event, ctx) => {
-    rememberContext(ctx)
-    client ??= loadClientFromDisk()
-  })
+    rememberContext(ctx);
+    client ??= loadClientFromDisk();
+  });
 
   pi.on('before_agent_start', async (event, ctx) => {
-    rememberContext(ctx)
+    rememberContext(ctx);
 
-    const request = pendingInjection ?? activeRequest
+    const request = pendingInjection ?? activeRequest;
     if (!request) {
-      return
+      return;
     }
 
     return {
-      systemPrompt: buildWechatSystemPrompt(event.systemPrompt, request)
-    }
-  })
+      systemPrompt: resolveBuildSystemPrompt(event.systemPrompt, request),
+    };
+  });
 
   pi.on('agent_start', async (_event, ctx) => {
-    rememberContext(ctx)
-    agentIdle = false
+    rememberContext(ctx);
+    agentIdle = false;
 
     if (pendingInjection) {
-      activeRequest = pendingInjection
-      pendingInjection = null
+      activeRequest = pendingInjection;
+      pendingInjection = null;
     }
-  })
+  });
 
   pi.on('agent_end', async (event, ctx) => {
-    rememberContext(ctx)
-    agentIdle = true
-    await completeActiveRequest(event.messages as Array<{ role?: string; content?: unknown }>)
-  })
+    rememberContext(ctx);
+    agentIdle = true;
+    await completeActiveRequest(
+      event.messages as Array<{ role?: string; content?: unknown }>,
+    );
+  });
 
   pi.on('session_shutdown', async (_event, ctx) => {
-    rememberContext(ctx)
-    await stopBridge()
-  })
+    rememberContext(ctx);
+    await stopBridge();
+  });
+
+  pi.on('model_select', async (event, ctx) => {
+    rememberContext(ctx);
+
+    const prev = event.previousModel
+      ? `${event.previousModel.provider}/${event.previousModel.id}`
+      : 'none';
+    const next = `${event.model.provider}/${event.model.id}`;
+
+    notify(`模型已更改 (${event.source}): ${prev} -> ${next}`, 'info');
+  });
 }
 
 async function renderQrCode(url: string): Promise<string> {
   return new Promise((resolve) => {
-    qrcode.generate(url, { small: true }, (code) => resolve(code))
-  })
+    qrcode.generate(url, { small: true }, (code) => resolve(code));
+  });
 }
 
-function extractFinalAssistantText(messages: Array<{ role?: string; content?: unknown }>): string | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index]
-    if (message?.role !== 'assistant' || !Array.isArray(message.content)) {
-      continue
-    }
-
-    const text = message.content
-      .filter((part): part is { type: 'text'; text: string } => {
-        return typeof part === 'object' && part !== null && (part as { type?: string }).type === 'text'
-      })
-      .map((part) => part.text.trim())
-      .filter(Boolean)
-      .join('\n')
-      .trim()
-
-    if (text) {
-      return text
-    }
-  }
-
-  return null
+function extractFinalAssistantText(
+  messages: Array<{ role?: string; content?: unknown }>,
+) {
+  return messages
+    .findLast(
+      (message): message is { role: 'assistant'; content: Array<unknown> } => {
+        return message?.role === 'assistant' && Array.isArray(message.content);
+      },
+    )
+    ?.content.filter((part): part is { type: 'text'; text: string } => {
+      return (
+        typeof part === 'object' &&
+        part !== null &&
+        (part as { type?: string }).type === 'text'
+      );
+    })
+    .map((part) => part.text.trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim();
 }
 
 function summarizePreview(text: string): string {
-  const normalized = text.replace(/\s+/g, ' ').trim()
+  const normalized = text.replace(/\s+/g, ' ').trim();
   if (normalized.length <= PREVIEW_LIMIT) {
-    return normalized
+    return normalized;
   }
 
-  return `${normalized.slice(0, PREVIEW_LIMIT - 1)}…`
+  return `${normalized.slice(0, PREVIEW_LIMIT - 1)}…`;
 }
 
 function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === 'AbortError'
+  return error instanceof Error && error.name === 'AbortError';
 }

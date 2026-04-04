@@ -205,6 +205,4 @@ function chunkText(text: string, maxLength: number): string[] {
   return chunks
 }
 
-function isSessionExpired(error: unknown): boolean {
-  return error instanceof ApiError && error.code === -14
-}
+
