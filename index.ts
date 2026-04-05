@@ -550,7 +550,13 @@ export default function wechatExtension(pi: ExtensionAPI) {
       : 'none';
     const next = `${event.model.provider}/${event.model.id}`;
 
-    sendReply(`模型已更改 (${event.source}): ${prev} -> ${next}`, 'info');
+    const message = `模型已更改 (${event.source}): ${prev} -> ${next}`;
+    const userId = activeRequest?.userId ?? pendingInjection?.userId;
+    if (userId) {
+      await sendReply(userId, message);
+    } else {
+      notify(message, 'info');
+    }
   });
 }
 
